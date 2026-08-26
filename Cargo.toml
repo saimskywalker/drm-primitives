@@ -1,0 +1,36 @@
+[package]
+name = "drm-primitives"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["saimskywalker"]
+license = "MIT"
+description = "Widevine PSSH box generation and parsing, AES-128-CBC segment encryption, HKDF key derivation, FairPlay certificate handling and HLS EXT-X-KEY parsing."
+repository = "https://github.com/saimskywalker/drm-primitives"
+documentation = "https://docs.rs/drm-primitives"
+readme = "README.md"
+keywords = ["drm", "widevine", "fairplay", "pssh", "hls"]
+categories = ["multimedia::video", "cryptography", "parser-implementations"]
+exclude = [".github/"]
+
+[dependencies]
+# AES-128-CBC. `cbc` and `cipher` are the RustCrypto block-mode and trait
+# crates; taking them instead of hand-rolling CBC is what gives us tested
+# PKCS#7 unpadding rather than an unchecked truncate.
+aes = "0.8"
+cbc = "0.1"
+cipher = { version = "0.4", features = ["alloc", "block-padding"] }
+
+# Key derivation.
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Encoding, for EXT-X-KEY IVs and FairPlay init data.
+base64 = "0.22"
+hex = "0.4"
+
+# OS randomness. `getrandom` rather than `rand`: the only thing this crate
+# needs is 16 bytes from the system CSPRNG.
+getrandom = { version = "0.3", features = ["std"] }
+
+thiserror = "2.0"

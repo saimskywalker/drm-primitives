@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Never commit key material or certificates — this crate handles both, and a
+# fixture is the easy way to leak one.
+*.pem
+*.der
+*.cer
+*.key
