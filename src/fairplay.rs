@@ -3,7 +3,8 @@
 //! Two separate jobs live here because both sit on the FairPlay path:
 //!
 //! - [`FairPlayCertificate`] loads the DER certificate Apple issues to a
-//!   FairPlay Streaming deployment and locates the public key inside it.
+//!   FairPlay Streaming deployment and extracts the `SubjectPublicKeyInfo`
+//!   from it. It reads the certificate; it does not verify it.
 //! - [`HlsKeyParser`] reads an `#EXT-X-KEY` tag out of a playlist. It is not
 //!   FairPlay-specific — it reads `METHOD=AES-128` and `METHOD=SAMPLE-AES`
 //!   tags equally — but the FairPlay `skd://` URI is the reason it is here.
@@ -45,54 +46,217 @@ impl FairPlayCertificate {
         Ok(std::fs::read(path.as_ref())?)
     }
 
-    /// Locate the first DER `SEQUENCE` with a two-byte length inside a
-    /// certificate and return it, header included.
+    /// Extract the `SubjectPublicKeyInfo` from an X.509 certificate, DER
+    /// header included.
     ///
-    /// # This is a heuristic, not a DER parser
+    /// The output is the same bytes `openssl x509 -pubkey` would print, in DER
+    /// rather than PEM — an `AlgorithmIdentifier` followed by the key itself,
+    /// which is the form a key is normally handed to an RSA or EC
+    /// implementation in.
     ///
-    /// It scans for the byte pair `30 82` — `SEQUENCE`, long-form length, two
-    /// length bytes — and returns that structure. In an RSA certificate of the
-    /// usual shape the outermost such structure is the one being looked for,
-    /// which is why the trick works often enough to be useful. It has no idea
-    /// what it found, and it will happily return a different `SEQUENCE` from a
-    /// certificate laid out differently. If the identity of the key matters,
-    /// parse the certificate with an X.509 crate instead.
+    /// # What is and is not checked
+    ///
+    /// This walks the certificate far enough to find the field and no further:
+    /// outer `SEQUENCE`, `tbsCertificate`, then past the optional
+    /// `[0] EXPLICIT version` and the five fields before
+    /// `subjectPublicKeyInfo`. Every length is bounds-checked against the
+    /// structure that encloses it.
+    ///
+    /// It does **not** verify the certificate: no signature, no issuer, no
+    /// expiry, and no check that the key inside is one Apple issued. It also
+    /// does not decode the key — the `SubjectPublicKeyInfo` is returned as
+    /// bytes, not as a modulus and exponent.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Malformed`] if no such structure is found, or if the
-    /// one that is found claims a length running past the end of the input.
+    /// - [`Error::Truncated`] if the certificate ends inside a DER structure
+    ///   one of its own length fields promised.
+    /// - [`Error::Malformed`] if the input is not shaped like an X.509
+    ///   certificate, if a field runs past the structure enclosing it, or if a
+    ///   DER length uses the indefinite form or is too wide to address.
+    ///
+    /// A real certificate is several hundred bytes, so the shape is easier to
+    /// see in a skeleton one — a `tbsCertificate` holding the five fields that
+    /// come before the key, and then the key:
+    ///
+    /// ```
+    /// # fn main() -> Result<(), drm_primitives::Error> {
+    /// use drm_primitives::fairplay::FairPlayCertificate;
+    ///
+    /// // SEQUENCE {                          -- Certificate
+    /// //   SEQUENCE {                        -- tbsCertificate (v1: no version)
+    /// //     INTEGER, INTEGER, INTEGER,      -- serialNumber, signature, issuer
+    /// //     INTEGER, INTEGER,               -- validity, subject
+    /// //     SEQUENCE { INTEGER 7 } } }      -- subjectPublicKeyInfo
+    /// let certificate = [
+    ///     0x30, 0x16, 0x30, 0x14, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02, 0x02,
+    ///     0x01, 0x03, 0x02, 0x01, 0x04, 0x02, 0x01, 0x05, 0x30, 0x03, 0x02,
+    ///     0x01, 0x07,
+    /// ];
+    ///
+    /// assert_eq!(
+    ///     FairPlayCertificate::extract_public_key(&certificate)?,
+    ///     [0x30, 0x03, 0x02, 0x01, 0x07],
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn extract_public_key(certificate: &[u8]) -> Result<Vec<u8>> {
-        let mut search_from = 0usize;
-
-        while let Some(relative) = certificate[search_from..]
-            .windows(2)
-            .position(|window| window == [0x30, 0x82])
-        {
-            let start = search_from + relative;
-
-            // Need the two length bytes that follow the 0x30 0x82 pair.
-            if start + 4 <= certificate.len() {
-                let len =
-                    u16::from_be_bytes([certificate[start + 2], certificate[start + 3]]) as usize;
-                if let Some(end) = start.checked_add(4).and_then(|s| s.checked_add(len)) {
-                    if end <= certificate.len() {
-                        return Ok(certificate[start..end].to_vec());
-                    }
-                }
-            }
-
-            search_from = start + 1;
-            if search_from + 2 > certificate.len() {
-                break;
-            }
+        // Certificate ::= SEQUENCE {
+        //     tbsCertificate       TBSCertificate,
+        //     signatureAlgorithm   AlgorithmIdentifier,
+        //     signatureValue       BIT STRING }
+        let outer = read_tlv(certificate, 0)?;
+        if outer.tag != DER_SEQUENCE {
+            return Err(malformed_certificate(
+                "the input does not begin with a DER SEQUENCE, so it is not an X.509 certificate",
+            ));
         }
 
-        Err(Error::Malformed {
-            what: "FairPlay certificate",
-            detail: "no DER SEQUENCE with a two-byte length was found",
-        })
+        let tbs = read_tlv(certificate, outer.start)?;
+        if tbs.tag != DER_SEQUENCE {
+            return Err(malformed_certificate("tbsCertificate is not a SEQUENCE"));
+        }
+        if tbs.end > outer.end {
+            return Err(malformed_certificate(
+                "tbsCertificate runs past the end of the certificate",
+            ));
+        }
+
+        // TBSCertificate ::= SEQUENCE {
+        //     version         [0] EXPLICIT Version DEFAULT v1,  -- absent in v1
+        //     serialNumber        CertificateSerialNumber,
+        //     signature           AlgorithmIdentifier,
+        //     issuer              Name,
+        //     validity            Validity,
+        //     subject             Name,
+        //     subjectPublicKeyInfo SubjectPublicKeyInfo,
+        //     ... }
+        //
+        // Every field is read against `tbs.end` rather than the end of the
+        // buffer, so a length that reaches past tbsCertificate is rejected
+        // instead of walking into the signature that follows it.
+        let mut offset = tbs.start;
+
+        let first = read_field(certificate, offset, tbs.end)?;
+        if first.tag == DER_CONTEXT_0 {
+            offset = first.end;
+        }
+
+        for _ in 0..FIELDS_BEFORE_PUBLIC_KEY {
+            offset = read_field(certificate, offset, tbs.end)?.end;
+        }
+
+        let spki = read_field(certificate, offset, tbs.end)?;
+        if spki.tag != DER_SEQUENCE {
+            return Err(malformed_certificate(
+                "subjectPublicKeyInfo is not a SEQUENCE",
+            ));
+        }
+
+        Ok(certificate[offset..spki.end].to_vec())
     }
+}
+
+/// The DER tag for a `SEQUENCE`, constructed.
+const DER_SEQUENCE: u8 = 0x30;
+
+/// The DER tag for `[0]`, context-specific and constructed — the optional
+/// explicit `version` at the front of a v3 `tbsCertificate`.
+const DER_CONTEXT_0: u8 = 0xA0;
+
+/// `serialNumber`, `signature`, `issuer`, `validity` and `subject`: the five
+/// fields sitting between the optional version and `subjectPublicKeyInfo`.
+const FIELDS_BEFORE_PUBLIC_KEY: usize = 5;
+
+/// One DER tag-length-value, located inside a buffer.
+#[derive(Debug, Clone, Copy)]
+struct Tlv {
+    /// The identifier octet.
+    tag: u8,
+    /// Offset of the first content byte.
+    start: usize,
+    /// Offset one past the last content byte — also where the next TLV begins.
+    end: usize,
+}
+
+fn malformed_certificate(detail: &'static str) -> Error {
+    Error::Malformed {
+        what: "FairPlay certificate",
+        detail,
+    }
+}
+
+/// Read the TLV at `offset` and require it to fit inside its parent structure.
+fn read_field(bytes: &[u8], offset: usize, parent_end: usize) -> Result<Tlv> {
+    let field = read_tlv(bytes, offset)?;
+    if field.end > parent_end {
+        return Err(malformed_certificate(
+            "a certificate field runs past the structure enclosing it",
+        ));
+    }
+    Ok(field)
+}
+
+/// Read one DER tag-length-value header, reporting truncation and unusable
+/// lengths rather than indexing on numbers taken from the input.
+fn read_tlv(bytes: &[u8], offset: usize) -> Result<Tlv> {
+    let truncated = |needed: usize| Error::Truncated {
+        what: "FairPlay certificate",
+        needed,
+        available: bytes.len(),
+    };
+
+    let tag = *bytes.get(offset).ok_or_else(|| truncated(offset + 1))?;
+    if tag & 0x1F == 0x1F {
+        return Err(malformed_certificate(
+            "high-tag-number form identifiers are not supported",
+        ));
+    }
+
+    let first_length_byte = *bytes.get(offset + 1).ok_or_else(|| truncated(offset + 2))?;
+    let (length, header_len) = if first_length_byte < 0x80 {
+        // Short form: the byte is the length.
+        (first_length_byte as usize, 2)
+    } else {
+        // Long form: the low seven bits count the length bytes that follow.
+        let count = (first_length_byte & 0x7F) as usize;
+        if count == 0 {
+            // 0x80 is the indefinite form. Legal BER, never legal DER, and
+            // it has no length to bounds-check against.
+            return Err(malformed_certificate(
+                "indefinite DER lengths are not valid in a certificate",
+            ));
+        }
+        if count > core::mem::size_of::<usize>() {
+            return Err(malformed_certificate(
+                "a DER length field wider than a machine word cannot be addressed",
+            ));
+        }
+
+        let from = offset + 2;
+        let to = from + count;
+        let raw = bytes.get(from..to).ok_or_else(|| truncated(to))?;
+
+        // `count` is at most `size_of::<usize>()`, so this shifts in exactly
+        // as many bytes as a `usize` holds and cannot overflow.
+        let length = raw
+            .iter()
+            .fold(0usize, |acc, byte| (acc << 8) | *byte as usize);
+        (length, 2 + count)
+    };
+
+    let start = offset
+        .checked_add(header_len)
+        .ok_or_else(|| malformed_certificate("a DER header overflows the addressable range"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| malformed_certificate("a DER length overflows the addressable range"))?;
+    if end > bytes.len() {
+        return Err(truncated(end));
+    }
+
+    Ok(Tlv { tag, start, end })
 }
 
 /// The two identifiers carried in a 16-byte FairPlay initialisation blob.

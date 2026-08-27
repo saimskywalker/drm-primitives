@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`FairPlayCertificate::extract_public_key` returns the public key.** It
+  scanned for the first `30 82` byte pair — `SEQUENCE`, long-form length — and
+  returned the structure it found. In any DER X.509 certificate the outermost
+  such structure is the certificate itself, so given a real certificate the
+  function returned its whole input, and a caller who sent the result where a
+  public key was expected sent the entire file. It now walks the certificate to
+  `tbsCertificate.subjectPublicKeyInfo` and returns that, bounds-checking every
+  DER length against the structure enclosing it. The tests cover a v1
+  certificate, a v3 certificate (where the optional explicit `version` field
+  has to be skipped) and a P-256 certificate whose key uses a short-form DER
+  length, which the old scan could not have found at all.
+- The certificate reader rejects the indefinite DER length form, a length field
+  wider than a machine word, and any field that runs past the structure
+  enclosing it, rather than reading into the signature that follows.
+
+### Documentation
+
+- The README no longer says the crate parses a `pssh` box out of a `moov`, a
+  DASH `<cenc:pssh>` element or a base64 blob. `PsshBox::parse` takes the box
+  bytes; locating and decoding them is the caller's job.
+
+
 ## [0.1.0] - 2026-08-27
 
 First release. The code was extracted from a private streaming backend, where
