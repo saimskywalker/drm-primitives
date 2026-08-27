@@ -37,7 +37,9 @@ pub const WIDEVINE_SYSTEM_ID: [u8; 16] = [
 /// The length of a CENC key ID, in bytes. Key IDs are UUIDs.
 pub const KEY_ID_LEN: usize = 16;
 
-/// The fixed part of a `pssh` box: size, type, version, flags and system ID.
+/// The smallest a `pssh` box can be: 28 bytes of size, type, version, flags and
+/// system ID, plus the four-byte length field that always follows them — the
+/// key ID count in a version 1 box, the data size in a version 0 one.
 const HEADER_LEN: usize = 32;
 
 /// A parsed — or about to be serialised — `pssh` box.

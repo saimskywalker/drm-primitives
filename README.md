@@ -4,8 +4,9 @@ Rust building blocks for DRM-protected streaming:
 
 - **Generate a Widevine PSSH box in Rust**, version 1 (key IDs in the clear) or
   version 0 (an opaque payload you already have).
-- **Parse a PSSH box** out of an ISO-BMFF `moov`, a DASH `<cenc:pssh>` element
-  or a base64 blob, and read its version, system ID and key IDs back.
+- **Parse a PSSH box** from its bytes and read its version, system ID and key
+  IDs back. `PsshBox::parse` takes the box itself — finding it inside a `moov`
+  and base64-decoding a DASH `<cenc:pssh>` element are the caller's job.
 - **AES-128 HLS segment encryption** — AES-128-CBC with PKCS#7, plus key and IV
   generation from the OS CSPRNG.
 - **HKDF-SHA256 content-key derivation**, so a key service can recompute a
@@ -101,10 +102,14 @@ key URI with a query string can contain a comma, and a parser that splits on
 every `,` truncates the URI into something that still looks like it parsed.
 
 `FairPlayCertificate::load_from_file` reads the DER certificate Apple issues to
-a FairPlay Streaming deployment, and `extract_public_key` locates the first DER
-`SEQUENCE` inside it. That last one is a heuristic and says so in its own
-documentation — if the identity of the key matters, parse the certificate with
-a real X.509 crate.
+a FairPlay Streaming deployment, and `extract_public_key` returns the
+`SubjectPublicKeyInfo` out of it — the same bytes `openssl x509 -pubkey` prints,
+in DER rather than PEM. It walks the certificate structure and bounds-checks
+every length against the structure enclosing it.
+
+It reads the certificate; it does not verify it. No signature, issuer or expiry
+is checked, and nothing confirms the key inside is one Apple issued. If that
+matters, verify the certificate with an X.509 crate first.
 
 ## What this crate does not do
 
